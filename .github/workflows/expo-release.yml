@@ -1,0 +1,768 @@
+name: Expo release
+
+# Builds an Expo app for iOS and Android, signs it for the stores and uploads it for internal
+# testing: iOS to App Store Connect, where the build appears in TestFlight, and Android to Google
+# Play's internal testing track. An app calls it from a workflow of its own, such as:
+#
+#   name: Phone Release
+#   run-name: >-
+#     ${{ (github.ref_name == 'main' || startsWith(github.ref_name, 'release/') || startsWith(github.ref_name, 'hotfix/'))
+#     && format('Signed build from {0}', github.ref_name)
+#     || format('Unsigned build from {0}', github.ref_name) }}
+#   on:
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: uvamaplab/mobile-release/.github/workflows/expo-release.yml@v1
+#       with:
+#         build-number-offset: 100
+#       secrets: inherit
+#
+# id-token lets the android job prove to Google which repository and environment it runs in, and
+# "secrets: inherit" passes the app's secrets through. Everything here runs as the calling app: its
+# repository, branch, run number, variables and "release" environment. README.md lists what an app
+# has to set up. An upload is not a release: adding a build to a TestFlight group or an App Store
+# version, and promoting one to production in Play Console, stay manual steps.
+#
+# Each run is one of two kinds, which the caller's run-name names and the summary repeats with the
+# version and build number:
+#   Signed build from <branch>    a run on main, release/* or hotfix/*: signed, uploaded to App
+#                                 Store Connect and Google Play, and kept as workflow artifacts
+#                                 (.ipa, .aab and .apk)
+#   Unsigned build from <branch>  a run on any other branch. It gets no provisioning profile or
+#                                 upload key, so iOS only compiles for a device and Android signs
+#                                 with the debug key, which installs on a test device but cannot go
+#                                 to Play. This is how a change to an app's native configuration,
+#                                 or to this file, is tested before it reaches a branch that signs.
+# A run signs when it has the provisioning profile and the upload key, which only the app's
+# "release" environment holds. The version job below decides which runs ask for that environment,
+# the caller's run-name names them, and the environment's deployment-branch policy decides which
+# may have it; keep all three in step. A branch the version job signs but the policy refuses fails
+# as its build jobs start.
+#
+# Version and build number:
+#   - expo.version in app.json is the version (iOS CFBundleShortVersionString, Android versionName).
+#   - The build number (iOS CFBundleVersion, Android versionCode) is the caller's run number plus
+#     build-number-offset, shared by both platforms. The run number rises with every run on any
+#     branch, so neither store sees a number twice. An app sets its offset above every build number
+#     it has uploaded before, from EAS or elsewhere. GitHub counts runs per workflow file path, so
+#     renaming the calling workflow's file moves it to another counter; raise the offset with it.
+#
+# Toolchain. The xcode, java and node inputs pin the versions the builds use. Their defaults build
+# Expo SDK 55 and 56: Xcode 26.6, which the self-hosted Mac and GitHub's macos-26 image both have,
+# and JDK 17 for Gradle and the Android Gradle plugin. Stay on Xcode 26 until the app's native
+# template adopts the UIScene lifecycle, which Apple requires of apps built with Xcode 27. Gradle
+# downloads any Android SDK components the build lacks.
+#
+# Runners. The ios and android jobs build on a self-hosted Mac, which saves macOS minutes and builds
+# faster, and fall back to GitHub's runners so no build depends on that machine. Each job takes the
+# Mac whenever it is online, waiting in its queue if it is busy, and builds on GitHub's runner only
+# when it is not: macos-26 for iOS and ubuntu-latest for Android. Each job is turned on by its own
+# variable, and both need the token; without them, every build goes to GitHub:
+#   IOS_RUNNER           organization or repository variable: the labels of the runner the ios job
+#                        may use, as a JSON array, such as ["self-hosted","macOS","ARM64","ios"]
+#   ANDROID_RUNNER       organization or repository variable: the same for the android job
+#   RUNNER_STATUS_TOKEN  organization or repository secret: a fine-grained token that can list the
+#                        organization's self-hosted runners (organization permission "Self-hosted
+#                        runners: read"), the calling repository's (repository permission
+#                        "Administration: read"), or both. GITHUB_TOKEN cannot be granted either.
+# The runners job looks for an online runner with those labels among the organization's runners
+# and the calling repository's own. An organization runner takes the job only if its runner group
+# lets the calling repository, and this workflow, use it; one that does not leaves the job waiting
+# in the queue, so keep every calling repository in the group. A runner runs one job at a time:
+# with one iOS runner on the Mac, the iOS builds of all apps take turns, which also keeps them from
+# changing the macOS user's keychain search list at once. A self-hosted runner of another
+# repository on the same Mac user can still overlap: the ios job adds its keychain to the list and
+# takes only its own off again, but a job that replaces the list, as digital-trails' does, can make
+# an overlapping iOS build here fail to sign. Re-run it.
+# The check is made once, as the run starts. If the Mac drops out mid-build the job fails, and
+# "Re-run all jobs" checks again, where "Re-run failed jobs" would reuse the answer and wait for the
+# Mac. The steps leave a self-hosted Mac as they found it, apart from the toolchains they install:
+# CocoaPods from Homebrew where the Mac has none, and Android SDK components in ANDROID_HOME, or
+# ~/Library/Android/sdk where the runner sets none. Node and Java come from the runner's tool
+# cache, Xcode is chosen through the environment rather than sudo xcode-select, Gradle runs without
+# a daemon, the builds and the signing keys stay in the job's temporary folder, and the ios job's
+# last step removes its keychain.
+#
+# Signing secrets and Google Play. The certificate and the App Store Connect key belong to the Apple
+# team, and the Google service account to the organization, not to one app, so they are uvamaplab
+# organization secrets and variables shared with the app repositories. Every run can read them, on
+# any branch. What belongs to one app lives in its "release" environment (Settings > Environments),
+# and decides which runs sign:
+#   IOS_CERTIFICATE_BASE64                  organization secret: the Apple Distribution certificate
+#                                           with its private key, as a .p12 export, base64-encoded
+#   IOS_CERTIFICATE_PASSWORD                organization secret: the .p12 password
+#   APP_STORE_CONNECT_PRIVATE_KEY           organization secret: the App Store Connect API key that
+#                                           uploads to TestFlight: the contents of the downloaded
+#                                           .p8 file, as is
+#   APP_STORE_CONNECT_KEY_ID                organization secret: that key's Key ID
+#   APP_STORE_CONNECT_ISSUER_ID             organization secret: the team's Issuer ID
+#   GOOGLE_PLAY_WORKLOAD_IDENTITY_PROVIDER  organization variable: projects/<number>/locations/
+#                                           global/workloadIdentityPools/<pool>/providers/<provider>
+#   GOOGLE_PLAY_SERVICE_ACCOUNT             organization variable: the email of the service account
+#                                           that Play Console allows to release the app to testing
+#                                           tracks
+#   IOS_PROVISIONING_PROFILE_BASE64         "release" environment secret: the App Store provisioning
+#                                           profile for the bundle identifier in app.json,
+#                                           base64-encoded
+#   ANDROID_KEYSTORE_BASE64                 "release" environment secret: the app's Play upload key
+#                                           as a PKCS12 keystore, base64-encoded
+#   ANDROID_KEYSTORE_PASSWORD               "release" environment secret: its password; a PKCS12
+#                                           keystore has one password for the store and the key,
+#                                           and it is used for both
+# All of them are required on a signed run. The profile and the keystore must stay in the
+# environment: as repository or organization secrets, every run would sign and upload. A secret or
+# variable of the same name in the environment or the repository takes precedence over the
+# organization's. The signing identity, the team, the profile name and the key alias are read from
+# these files, so nothing else has to be kept in step with them.
+# The android job signs in to Google through Workload Identity Federation: GitHub vouches for the
+# job, and Google lets it act as the service account. The provider accepts only jobs of the
+# repositories it lists, in their "release" environment, which the deployment-branch policy limits
+# to the branches allowed to sign.
+
+on:
+  workflow_call:
+    inputs:
+      build-number-offset:
+        description: Added to the run number to make the build number; see "Version and build number" at the top.
+        type: number
+        required: true
+      xcode:
+        description: The Xcode version the iOS build uses, installed at /Applications/Xcode_<version>.app.
+        type: string
+        default: '26.6'
+      java:
+        description: The JDK version the Android build uses.
+        type: string
+        default: '17'
+      node:
+        description: The Node.js version both builds use.
+        type: string
+        default: '22'
+
+permissions:
+  contents: read
+
+env:
+  XCODE: ${{ inputs.xcode }}
+  JAVA: ${{ inputs.java }}
+  NODE: ${{ inputs.node }}
+  BUILD_NUMBER_OFFSET: ${{ inputs.build-number-offset }}
+
+jobs:
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+      signed: ${{ steps.version.outputs.signed }}
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Read the version, compute the build number and decide whether to sign
+        id: version
+        run: |
+          VERSION=$(jq -r '.expo.version // empty' app.json)
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::No expo.version found in app.json"
+            exit 1
+          fi
+          BUILD=$(( BUILD_NUMBER_OFFSET + GITHUB_RUN_NUMBER ))
+          # The branches the "release" environment allows; see the kinds of run at the top.
+          case "$GITHUB_REF_NAME" in
+            main|release/*|hotfix/*) SIGNED=true ;;
+            *) SIGNED=false ;;
+          esac
+          if [[ "$SIGNED" == true ]]; then
+            SUMMARY="Signed build $VERSION ($BUILD) from $GITHUB_REF_NAME"
+          else
+            SUMMARY="Unsigned build $VERSION ($BUILD) from $GITHUB_REF_NAME"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Chooses where the ios and android jobs build; see "Runners" at the top. Every way this can go
+  # wrong ends on GitHub's runners, so the self-hosted Mac is never something a build waits on.
+  runners:
+    runs-on: ubuntu-latest
+    outputs:
+      ios: ${{ steps.pick.outputs.ios }}
+      android: ${{ steps.pick.outputs.android }}
+    steps:
+
+      - name: Use the self-hosted Mac if it is online
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          IOS_RUNNER: ${{ vars.IOS_RUNNER }}
+          ANDROID_RUNNER: ${{ vars.ANDROID_RUNNER }}
+        run: |
+          RUNNERS=
+          # Sets RUNNERS to the self-hosted runners of the calling repository and of the
+          # organization, as one JSON array, the first time it is called. Fails if the token can
+          # list neither.
+          list_runners() {
+            [[ -n "$RUNNERS" ]] && return
+            local repo org
+            repo=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners?per_page=100" --jq .runners 2> /dev/null) || repo=
+            org=$(gh api "orgs/$GITHUB_REPOSITORY_OWNER/actions/runners?per_page=100" --jq .runners 2> /dev/null) || org=
+            [[ -z "$repo" && -z "$org" ]] && return 1
+            RUNNERS=$(jq -cn --argjson repo "${repo:-[]}" --argjson org "${org:-[]}" '$repo + $org')
+          }
+          # pick JOB VARIABLE HOSTED: sets output JOB to the labels in VARIABLE if a runner with
+          # them is online, and to GitHub's runner HOSTED otherwise.
+          pick() {
+            local job=$1 var=$2 hosted=$3 wanted=${!2} labels online
+            use() { echo "$job=$1" >> "$GITHUB_OUTPUT"; }
+            if [[ -z "$wanted" ]]; then
+              echo "$var is not set; $job builds on $hosted."
+              use "\"$hosted\""; return
+            fi
+            if ! labels=$(jq -ce 'select(type == "array" and length > 0 and all(type == "string"))' <<< "$wanted" 2> /dev/null); then
+              echo "::warning::$var is not a JSON array of labels: $wanted. $job builds on $hosted."
+              use "\"$hosted\""; return
+            fi
+            if [[ -z "$GH_TOKEN" ]]; then
+              echo "::warning::RUNNER_STATUS_TOKEN is not set, so there is no way to see whether the self-hosted Mac is online. $job builds on $hosted."
+              use "\"$hosted\""; return
+            fi
+            if ! list_runners; then
+              echo "::warning::Could not list this repository's or the organization's runners; RUNNER_STATUS_TOKEN may have expired or lack the permission to. $job builds on $hosted."
+              use "\"$hosted\""; return
+            fi
+            # Labels match case-insensitively, as GitHub matches them. A busy runner still counts:
+            # a queue behind another build beats GitHub's runners.
+            online=$(jq --argjson want "$labels" '
+              ($want | map(ascii_downcase)) as $w
+              | [.[] | select(.status == "online"
+                  and ($w - [.labels[].name | ascii_downcase] | length == 0))]
+              | length' <<< "$RUNNERS") || online=0
+            if (( online > 0 )); then
+              echo "A self-hosted runner labelled $labels is online; $job builds there."
+              use "$labels"
+            else
+              echo "No self-hosted runner labelled $labels is online; $job builds on $hosted."
+              use "\"$hosted\""
+            fi
+          }
+          pick ios IOS_RUNNER macos-26
+          pick android ANDROID_RUNNER ubuntu-latest
+
+  ios:
+    needs: [version, runners]
+    runs-on: ${{ fromJSON(needs.runners.outputs.ios) }}
+    timeout-minutes: 90
+    # Unsigned builds get no environment and therefore no provisioning profile.
+    environment: ${{ needs.version.outputs.signed == 'true' && 'release' || '' }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BUILD: ${{ needs.version.outputs.build }}
+      HAS_SIGNING: ${{ secrets.IOS_CERTIFICATE_BASE64 != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+      HAS_TESTFLIGHT_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY != '' }}
+      # A runner started as a macOS service may have no locale, and CocoaPods fails without UTF-8.
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+    steps:
+
+      - name: Require the signing secrets on a signed run
+        if: needs.version.outputs.signed == 'true' && env.HAS_SIGNING != 'true'
+        run: |
+          echo "::error::IOS_CERTIFICATE_BASE64 or IOS_PROVISIONING_PROFILE_BASE64 is not set. A signed build is uploaded to App Store Connect, so it must be signed for the App Store; add the IOS_* secrets described in uvamaplab/mobile-release, and pass them with secrets: inherit."
+          exit 1
+
+      - name: Require the App Store Connect key on a signed run
+        if: needs.version.outputs.signed == 'true' && env.HAS_TESTFLIGHT_KEY != 'true'
+        run: |
+          echo "::error::APP_STORE_CONNECT_PRIVATE_KEY is not set. A signed build is uploaded to App Store Connect; add the key described in uvamaplab/mobile-release, and pass it with secrets: inherit."
+          exit 1
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        # Through the environment rather than sudo xcode-select, which would need a password on a
+        # self-hosted Mac and change the Xcode its owner uses. xcodebuild, xcrun, altool and
+        # CocoaPods all read DEVELOPER_DIR.
+        run: |
+          XCODE_APP="/Applications/Xcode_$XCODE.app"
+          if [[ ! -d "$XCODE_APP" ]]; then
+            echo "::error::$XCODE_APP is not installed. This build uses Xcode $XCODE, at that path; see \"Toolchain\" in uvamaplab/mobile-release."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XCODE_APP/Contents/Developer" xcodebuild -version
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE }}
+          # Only on GitHub's runners. A self-hosted Mac keeps its npm cache, which is its owner's
+          # ~/.npm, and saving it would upload that to the app's Actions cache every run.
+          cache: ${{ runner.environment == 'github-hosted' && 'npm' || '' }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install CocoaPods where the runner has none
+        # GitHub's macOS images have it; a self-hosted Mac may not, and gets it from Homebrew.
+        run: |
+          if ! command -v pod > /dev/null; then
+            BREW=$(command -v brew || ls /opt/homebrew/bin/brew /usr/local/bin/brew 2> /dev/null | head -1)
+            if [[ -z "$BREW" ]]; then
+              echo "::error::CocoaPods is not installed, and there is no Homebrew to install it with. Install CocoaPods on this Mac."
+              exit 1
+            fi
+            "$BREW" install cocoapods
+            BREW_BIN="$("$BREW" --prefix)/bin"
+            echo "$BREW_BIN" >> "$GITHUB_PATH"
+            PATH="$BREW_BIN:$PATH"
+          fi
+          echo "CocoaPods $(pod --version)"
+
+      - name: Generate the native project
+        # ios/ is not committed: Expo writes it from app.json and the installed packages.
+        run: |
+          npx expo prebuild --platform ios --no-install
+          # pod install builds a stub library for the Mac with plain clang, which on a self-hosted Mac
+          # took the Command Line Tools' SDK, newer than this Xcode's linker can read. Give it the
+          # selected Xcode's macOS SDK.
+          (cd ios && SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" pod install)
+          # The Xcode project, its app target and its scheme all take the name Expo gives them.
+          PROJECT=$(find ios -maxdepth 1 -name '*.xcodeproj' | head -1)
+          echo "APP=$(basename "$PROJECT" .xcodeproj)" >> "$GITHUB_ENV"
+
+      - name: Set the build number
+        # See "Version and build number" at the top.
+        run: |
+          INFO="ios/$APP/Info.plist"
+          plutil -replace CFBundleVersion -string "$BUILD" "$INFO"
+          echo "Version $(plutil -extract CFBundleShortVersionString raw -o - "$INFO") ($(plutil -extract CFBundleVersion raw -o - "$INFO"))"
+
+      - name: Install the certificate and provisioning profile
+        if: env.HAS_SIGNING == 'true'
+        id: signing
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          # Apple's WWDR G3 intermediate, which Apple Distribution certificates chain to; see below.
+          # SHA-256 of https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer, valid to 2030.
+          WWDR_G3_SHA256: dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f
+        run: |
+          # A throwaway keychain for this job, as in GitHub's guide to Apple certificates on runners.
+          KEYCHAIN="$RUNNER_TEMP/testflight.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          CERTIFICATE="$RUNNER_TEMP/distribution.p12"
+          PROFILE="$RUNNER_TEMP/appstore.mobileprovision"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$PROFILE"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Without the intermediate, macOS cannot chain the certificate to Apple's root and
+          # find-identity -v rejects it. GitHub's macOS images preinstall it; a self-hosted Mac may
+          # not, so the keychain brings its own, checked against the hash pinned above.
+          WWDR="$RUNNER_TEMP/AppleWWDRCAG3.cer"
+          curl -fsSL -o "$WWDR" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          echo "$WWDR_G3_SHA256  $WWDR" | shasum -a 256 -c -
+          security add-certificates -k "$KEYCHAIN" "$WWDR"
+
+          security import "$CERTIFICATE" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          rm -f "$CERTIFICATE"
+
+          # Put the keychain first in the user's search list without taking any other off it: a
+          # self-hosted Mac may be signing another job's build; see "Runners" at the top.
+          KEYCHAINS=("$KEYCHAIN")
+          while IFS= read -r LISTED; do
+            KEYCHAINS+=("$LISTED")
+          done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+          security list-keychains -d user -s "${KEYCHAINS[@]}"
+
+          # The signing identity is whichever distribution certificate the .p12 holds.
+          FOUND=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -nE 's/^[[:space:]]*[0-9]+\) ([0-9A-F]{40}) "((Apple|iPhone) Distribution: [^"]*)".*/\1 \2/p' | head -1)
+          if [[ -z "$FOUND" ]]; then
+            echo "::error::No Apple Distribution identity found in the imported certificate"
+            # Without -v, invalid identities are listed too, each with the reason it was rejected.
+            security find-identity -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+          CERTIFICATE_SHA1=${FOUND%% *}
+          IDENTITY=${FOUND#* }
+
+          # The profile must be an App Store profile for the bundle identifier in app.json.
+          PLIST=$(security cms -D -i "$PROFILE")
+          UUID=$(printf '%s' "$PLIST" | plutil -extract UUID raw -)
+          NAME=$(printf '%s' "$PLIST" | plutil -extract Name raw -)
+          TEAM=$(printf '%s' "$PLIST" | plutil -extract TeamIdentifier.0 raw -)
+          APP_ID=$(printf '%s' "$PLIST" | plutil -extract Entitlements.application-identifier raw -)
+          BUNDLE_ID=$(node -p "require('./app.json').expo.ios.bundleIdentifier")
+          if [[ "$APP_ID" != "$TEAM.$BUNDLE_ID" ]]; then
+            echo "::error::The provisioning profile '$NAME' is for $APP_ID, not $TEAM.$BUNDLE_ID, the bundle identifier in app.json."
+            exit 1
+          fi
+          if printf '%s' "$PLIST" | plutil -extract ProvisionedDevices xml1 -o - - > /dev/null 2>&1; then
+            echo "::error::The provisioning profile '$NAME' lists devices, so it is a development or ad hoc profile. App Store Connect needs an App Store profile."
+            exit 1
+          fi
+
+          # Xcode 16 moved the profiles folder; install into both the old and the new location.
+          for DIR in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$DIR"
+            cp "$PROFILE" "$DIR/$UUID.mobileprovision"
+          done
+
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "certificate=$CERTIFICATE_SHA1" >> "$GITHUB_OUTPUT"
+          echo "profile=$NAME" >> "$GITHUB_OUTPUT"
+          echo "profile-uuid=$UUID" >> "$GITHUB_OUTPUT"
+          echo "team=$TEAM" >> "$GITHUB_OUTPUT"
+          echo "bundle-id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "Signing $BUNDLE_ID with '$IDENTITY' and profile '$NAME'"
+
+      - name: Sign the app target with the certificate and profile
+        # In the project, and for the app target alone: a profile given on the xcodebuild command
+        # line applies to every target, and the CocoaPods targets fail on one. This is Expo's own
+        # helper for it.
+        if: env.HAS_SIGNING == 'true'
+        env:
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          PROFILE: ${{ steps.signing.outputs.profile }}
+          TEAM: ${{ steps.signing.outputs.team }}
+        run: |
+          node -e "
+            require('expo/config-plugins').IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj('.', {
+              targetName: process.env.APP,
+              profileName: process.env.PROFILE,
+              appleTeamId: process.env.TEAM,
+              buildConfiguration: 'Release',
+              codeSignIdentity: process.env.IDENTITY,
+            });
+          "
+
+      - name: Archive
+        if: env.HAS_SIGNING == 'true'
+        run: >
+          xcodebuild archive
+          -workspace "ios/$APP.xcworkspace"
+          -scheme "$APP"
+          -configuration Release
+          -destination generic/platform=iOS
+          -archivePath "$RUNNER_TEMP/$APP.xcarchive"
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          -quiet
+
+      - name: Export the package for App Store Connect
+        if: env.HAS_SIGNING == 'true'
+        env:
+          CERTIFICATE_SHA1: ${{ steps.signing.outputs.certificate }}
+          PROFILE_UUID: ${{ steps.signing.outputs.profile-uuid }}
+          TEAM: ${{ steps.signing.outputs.team }}
+          BUNDLE_ID: ${{ steps.signing.outputs.bundle-id }}
+        run: |
+          # manageAppVersionAndBuildNumber off keeps the build number this run chose.
+          cat > "$RUNNER_TEMP/ExportOptions.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>teamID</key>
+            <string>$TEAM</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>$CERTIFICATE_SHA1</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$PROFILE_UUID</string>
+            </dict>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/$APP.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          NAME="${{ github.event.repository.name }}-$VERSION-$BUILD"
+          mkdir -p packages
+          cp "$RUNNER_TEMP"/export/*.ipa "packages/$NAME.ipa"
+          ls -l packages
+
+      - name: Build unsigned, since there are no signing secrets
+        if: env.HAS_SIGNING != 'true'
+        run: >
+          xcodebuild build
+          -workspace "ios/$APP.xcworkspace"
+          -scheme "$APP"
+          -configuration Release
+          -destination generic/platform=iOS
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          -quiet
+          CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload the package as a workflow artifact
+        if: env.HAS_SIGNING == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-${{ needs.version.outputs.version }}-${{ needs.version.outputs.build }}
+          path: packages/*
+          if-no-files-found: error
+
+      - name: Upload to App Store Connect
+        if: env.HAS_SIGNING == 'true' && env.HAS_TESTFLIGHT_KEY == 'true'
+        env:
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          # altool reads the key from AuthKey_<Key ID>.p8 in this folder. It is the job's own, so
+          # the key stays out of the home folder a self-hosted Mac shares with other jobs.
+          API_PRIVATE_KEYS_DIR: ${{ runner.temp }}/private_keys
+        run: |
+          if [[ -z "$APP_STORE_CONNECT_KEY_ID" || -z "$APP_STORE_CONNECT_ISSUER_ID" ]]; then
+            echo "::error::APP_STORE_CONNECT_KEY_ID or APP_STORE_CONNECT_ISSUER_ID is not set."
+            exit 1
+          fi
+          mkdir -p "$API_PRIVATE_KEYS_DIR"
+          printf '%s\n' "$APP_STORE_CONNECT_PRIVATE_KEY" > "$API_PRIVATE_KEYS_DIR/AuthKey_$APP_STORE_CONNECT_KEY_ID.p8"
+          xcrun altool --upload-app --type ios --file packages/*.ipa \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          echo "Uploaded $VERSION ($BUILD) to App Store Connect. It reaches TestFlight once Apple has processed it; add it to an internal testing group there." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the signing keychain and the App Store Connect key
+        # A self-hosted Mac keeps its home folder between jobs. Deleting the keychain takes it off
+        # the search list as well, and leaves any other job's keychain on it.
+        if: always() && env.HAS_SIGNING == 'true'
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/testflight.keychain-db"
+          if [[ -f "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+          fi
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+  android:
+    needs: [version, runners]
+    runs-on: ${{ fromJSON(needs.runners.outputs.android) }}
+    timeout-minutes: 60
+    # Unsigned builds get no environment and therefore no upload key.
+    environment: ${{ needs.version.outputs.signed == 'true' && 'release' || '' }}
+    # id-token lets the job prove to Google which repository and environment it runs in. The
+    # calling workflow has to grant it too.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BUILD: ${{ needs.version.outputs.build }}
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      HAS_PLAY: ${{ vars.GOOGLE_PLAY_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GOOGLE_PLAY_SERVICE_ACCOUNT != '' }}
+    steps:
+
+      - name: Require the upload key on a signed run
+        if: needs.version.outputs.signed == 'true' && env.HAS_KEYSTORE != 'true'
+        run: |
+          echo "::error::ANDROID_KEYSTORE_BASE64 is not set. A signed build is uploaded to Google Play, so it must be signed with the app's upload key; add the ANDROID_* secrets described in uvamaplab/mobile-release, and pass them with secrets: inherit."
+          exit 1
+
+      - name: Require the Google Play settings on a signed run
+        if: needs.version.outputs.signed == 'true' && env.HAS_PLAY != 'true'
+        run: |
+          echo "::error::GOOGLE_PLAY_WORKLOAD_IDENTITY_PROVIDER or GOOGLE_PLAY_SERVICE_ACCOUNT is not set. A signed build is uploaded to Google Play; add the variables described in uvamaplab/mobile-release."
+          exit 1
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE }}
+          # Only on GitHub's runners; see the same step in the ios job.
+          cache: ${{ runner.environment == 'github-hosted' && 'npm' || '' }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: microsoft
+          java-version: ${{ env.JAVA }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Keep the Android SDK where Android Studio does, where the runner sets no ANDROID_HOME
+        # Hosted runners set it; a self-hosted Mac may not. An SDK already there is reused, and the
+        # components Gradle installs there are reused by the next run.
+        run: |
+          if [[ -z "$ANDROID_HOME" ]]; then
+            ANDROID_HOME="$HOME/Library/Android/sdk"
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          fi
+          # Gradle installs missing SDK components only once their licences are accepted.
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2> /dev/null | tail -1)
+          if [[ -n "$SDKMANAGER" ]] && ! yes | "$SDKMANAGER" --licenses > /dev/null; then
+            echo "::warning::$SDKMANAGER could not accept the SDK licences; Gradle may not be able to install missing components."
+          fi
+          echo "Android SDK at $ANDROID_HOME"
+
+      - name: Generate the native project
+        # android/ is not committed: Expo writes it from app.json and the installed packages.
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Set the version code
+        # See "Version and build number" at the top.
+        run: |
+          GRADLE=android/app/build.gradle
+          perl -pi -e 's/^(\s*versionCode\s+)\d+(\s*)$/$1$ENV{BUILD}$2/' "$GRADLE"
+          if ! grep -qE "^\s*versionCode\s+$BUILD\s*$" "$GRADLE"; then
+            echo "::error::Could not set versionCode in $GRADLE"
+            exit 1
+          fi
+          grep -E '^\s*version(Code|Name)\s' "$GRADLE"
+
+      - name: Decode the upload keystore and read its key alias
+        if: env.HAS_KEYSTORE == 'true'
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload.keystore"
+          # The alias is whatever single private key the keystore holds; keytool reads the
+          # password from the environment so it stays off the command line.
+          LISTING=$(keytool -list -v -keystore "$RUNNER_TEMP/upload.keystore" -storepass:env ANDROID_KEYSTORE_PASSWORD)
+          ALIASES=$(awk -F': ' '/^Alias name: /{a=$2} /^Entry type: PrivateKeyEntry/{print a}' <<< "$LISTING")
+          if [[ $(printf '%s\n' "$ALIASES" | grep -c .) -ne 1 ]]; then
+            echo "::error::Expected exactly one private key in the keystore, found: ${ALIASES:-none}"
+            exit 1
+          fi
+          SHA256=$(awk '/SHA256: /{print $2; exit}' <<< "$LISTING")
+          echo "alias=$ALIASES" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Signing with key '$ALIASES', certificate SHA-256 $SHA256"
+
+      - name: Build
+        env:
+          ANDROID_KEY_ALIAS: ${{ steps.keystore.outputs.alias }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          # Without a keystore, the template's release build signs with its debug key. With one,
+          # the Android Gradle plugin's injected signing properties, which Android Studio's
+          # "Generate Signed Bundle" uses, sign with the upload key instead. A Gradle daemon would
+          # outlive the job on a self-hosted Mac.
+          SIGNING=()
+          if [[ "$HAS_KEYSTORE" == "true" ]]; then
+            SIGNING=(
+              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/upload.keystore"
+              -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD"
+              -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS"
+              -Pandroid.injected.signing.key.password="$ANDROID_KEYSTORE_PASSWORD"
+            )
+          fi
+          cd android
+          ./gradlew bundleRelease assembleRelease --no-daemon "${SIGNING[@]}"
+
+      - name: Collect the packages
+        run: |
+          NAME="${{ github.event.repository.name }}-$VERSION-$BUILD"
+          mkdir -p packages
+          cp android/app/build/outputs/bundle/release/app-release.aab "packages/$NAME.aab"
+          cp android/app/build/outputs/apk/release/app-release.apk "packages/$NAME.apk"
+          ls -l packages
+
+      - name: Check that the bundle is signed with the upload key
+        # Play rejects a bundle signed with any other key, and says so less plainly than this.
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          EXPECTED: ${{ steps.keystore.outputs.sha256 }}
+        run: |
+          SIGNER=$(keytool -printcert -jarfile packages/*.aab | awk '/SHA256: /{print $2; exit}')
+          if [[ "$SIGNER" != "$EXPECTED" ]]; then
+            echo "::error::The bundle is signed by the certificate with SHA-256 ${SIGNER:-none}, not the upload key's $EXPECTED."
+            exit 1
+          fi
+          echo "The bundle is signed with the upload key."
+
+      - name: Upload the packages as a workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-${{ needs.version.outputs.version }}-${{ needs.version.outputs.build }}
+          path: packages/*
+          if-no-files-found: error
+
+      - name: Sign in to Google Play
+        if: env.HAS_KEYSTORE == 'true' && env.HAS_PLAY == 'true'
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GOOGLE_PLAY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Upload to the Google Play internal testing track
+        if: env.HAS_KEYSTORE == 'true' && env.HAS_PLAY == 'true'
+        env:
+          TOKEN: ${{ steps.google.outputs.access_token }}
+          AAB: packages/${{ github.event.repository.name }}-${{ needs.version.outputs.version }}-${{ needs.version.outputs.build }}.aab
+        run: |
+          set -o pipefail
+          APP_ID=$(jq -r '.expo.android.package // empty' app.json)
+          if [[ -z "$APP_ID" ]]; then
+            echo "::error::No expo.android.package found in app.json"
+            exit 1
+          fi
+          API="https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$APP_ID/edits"
+          UPLOAD="https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$APP_ID/edits"
+          # Prints the response on success. On failure, reports Google's error on stderr, where it
+          # isn't swallowed by a pipe or /dev/null, and fails.
+          play() {
+            local out
+            if ! out=$(curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" "$@"); then
+              echo "::error::Google Play API call failed: $out" >&2
+              return 1
+            fi
+            printf '%s' "$out"
+          }
+
+          # Everything happens in one edit, which takes effect only when committed; an edit left
+          # behind by a failure expires on its own.
+          EDIT=$(play -X POST "$API" | jq -r .id)
+
+          # Play never takes a version code twice and each run's is its own, so a bundle already
+          # there came from an earlier attempt of this run, whose commit also set the track. That
+          # makes "Re-run all jobs" safe after the upload went through.
+          BUNDLES=$(play "$API/$EDIT/bundles")
+          if jq -e --argjson code "$BUILD" 'any(.bundles[]?; .versionCode == $code)' <<< "$BUNDLES" > /dev/null; then
+            echo "Version code $BUILD is already on Google Play, from an earlier attempt of this run."
+            play -X DELETE "$API/$EDIT" > /dev/null
+            exit 0
+          fi
+
+          play -X POST -H "Content-Type: application/octet-stream" --data-binary "@$AAB" \
+            "$UPLOAD/$EDIT/bundles?uploadType=media" | jq -r '"Uploaded version code \(.versionCode)"'
+          jq -n --arg name "$VERSION ($BUILD)" --arg code "$BUILD" \
+            '{track: "internal", releases: [{name: $name, versionCodes: [$code], status: "completed"}]}' \
+            | play -X PUT -H "Content-Type: application/json" --data-binary @- "$API/$EDIT/tracks/internal" > /dev/null
+          play -X POST "$API/$EDIT:commit" > /dev/null
+          echo "$VERSION ($BUILD) is on the internal testing track." | tee -a "$GITHUB_STEP_SUMMARY"
