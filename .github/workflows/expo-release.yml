@@ -562,7 +562,9 @@ jobs:
   android:
     needs: [version, runners]
     runs-on: ${{ fromJSON(needs.runners.outputs.android) }}
-    timeout-minutes: 60
+    # GitHub's runners for private repositories are smaller than for public ones: groundswell's
+    # first build took 54 minutes on ubuntu-latest, where the Mac takes a fraction of that.
+    timeout-minutes: 120
     # Unsigned builds get no environment and therefore no upload key.
     environment: ${{ needs.version.outputs.signed == 'true' && 'release' || '' }}
     # id-token lets the job prove to Google which repository and environment it runs in. The
